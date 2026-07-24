@@ -1,4 +1,4 @@
-### Start this streamlit app with: streamlit run main_redo.py
+### Start this streamlit app with: streamlit run main.py
 
 ### # 1. Save the entire session variables and state
 ### dill.dump_session('my_session.pkl')
@@ -23,6 +23,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from wordcloud import WordCloud
 import io
+import json
+import zipfile
 import dill
 
 from datetime import datetime, time as datetime_time
@@ -143,13 +145,15 @@ def simulatePVB(i_df_energy_ts, i_static_param, i_show_output):
         else:
             exo_discount_factor = np.append(exo_discount_factor, np.repeat((1+i_static_param['discount_rate'])**-y,timesteps_per_year))
 
-    # Battery
-    exo_batt_aging_cal_perstep = (timestep_seconds / SECONDS_PER_HOUR) / (HOURS_PER_YEAR * i_static_param['bess_eol_years'])
-
-    # PV
-    v_pv_aging_cal = np.linspace(1, 1-num_years*(1-i_static_param['pv_eol_capacity'])/i_static_param['pv_eol_years'], num_timesteps, False) - (1-i_static_param['pv_init_soh']) # type: ignore
-    v_pv_aging_cal[v_pv_aging_cal < 0] = 0 # Ensure that once PV is EOL, it remains disabled
-    exo_E_pv_unitgeneration = v_pv_aging_cal * i_df_energy_ts['E_pvunitgeneration_kWh'] 
+    # Battery (aging removed)
+    # exo_batt_aging_cal_perstep = (timestep_seconds / SECONDS_PER_HOUR) / (HOURS_PER_YEAR * i_static_param['bess_eol_years'])
+    exo_batt_aging_cal_perstep = 0
+    
+    # PV (aging removed)
+    # v_pv_aging_cal = np.linspace(1, 1-num_years*(1-i_static_param['pv_eol_capacity'])/i_static_param['pv_eol_years'], num_timesteps, False) - (1-i_static_param['pv_init_soh']) # type: ignore
+    # v_pv_aging_cal[v_pv_aging_cal < 0] = 0 # Ensure that once PV is EOL, it remains disabled
+    # exo_E_pv_unitgeneration = v_pv_aging_cal * i_df_energy_ts['E_pvunitgeneration_kWh'] 
+    exo_E_pv_unitgeneration = i_df_energy_ts['E_pvunitgeneration_kWh'] 
     
     # Prices
     exo_C_export = i_df_energy_ts['C_tariff_export_$/kWh']
@@ -1159,20 +1163,25 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
             datetime_index = pd.date_range(start='2021-01-01', periods=num_points, freq='h')
     else:
         datetime_index = pd.date_range(start='2021-01-01', periods=num_points, freq='h')
-
-    # df_results.to_csv('df_results.csv')
     
-    df_residualloadprofile_Wh = df_results['E_final_grid_import_Wh'] - df_results['E_final_grid_export_Wh'] - df_results['E_final_grid_export_curtailed_Wh']  # Net grid load profile (positive = import, negative = export)    
+    df_residualloadprofile_Wh = df_results['E_final_grid_import_Wh'] - df_results['E_final_grid_export_Wh'] - df_results['E_final_grid_export_curtailed_Wh']  # Net grid load profile (positive = import, negative = export)
     
-    df_underlyingloadprofile_Wh = df_results['E_underlyingload_Wh']
-    df_exportprofile_Wh = df_results['E_final_grid_export_Wh']
-    
-    # Create DataFrame with datetime and consumption
+    # Create DataFrame with datetime and consumption breakdown
     df = pd.DataFrame({
         'datetime': datetime_index,
         'residual_consumption': df_residualloadprofile_Wh / 1000,  # Convert to kWh
-        'underlying_consumption': df_underlyingloadprofile_Wh / 1000,  # Convert to kWh
-        'grid_export': df_exportprofile_Wh / 1000,  # Convert to kWh
+        'underlying_consumption': df_results['E_underlyingload_Wh'] / 1000,  # Convert to kWh
+        'transportload': df_opt_exogenous_timeseries['E_transportload_kWh'], # type: ignore
+        'heatingload': df_opt_exogenous_timeseries['E_heatingload_kWh'], # type: ignore
+        'coolingload': df_opt_exogenous_timeseries['E_coolingload_kWh'], # type: ignore
+        'hotwaterload': df_opt_exogenous_timeseries['E_hotwaterload_kWh'], # type: ignore
+        'cookingload': df_opt_exogenous_timeseries['E_cookingload_kWh'], # type: ignore
+        'activityload': df_opt_exogenous_timeseries['E_activityload_kWh'], # type: ignore
+        'grid_export': df_results['E_final_grid_export_Wh'] / 1000,  # Convert to kWh
+        'pv_to_load': (df_results['E_PV_generation_Wh'] - df_results['E_initial_excess_generation_Wh']) / 1000,  # Convert to kWh
+        'pv_to_battery': df_results['E_batt_charge_Wh'] / 1000,  # Convert to kWh
+        'pv_curtailed': df_results['E_final_grid_export_curtailed_Wh'] / 1000,  # Convert to kWh
+        'battery_to_load': df_results['E_batt_discharge_Wh'] / 1000,  # Convert to kWh
     })
     df['hour'] = df['datetime'].dt.hour
     df['month'] = df['datetime'].dt.month
@@ -1209,20 +1218,32 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
     winter_underlyingprofile = df[df['season'] == 'Winter'].groupby('hour')['underlying_consumption'].mean()
     spring_underlyingprofile = df[df['season'] == 'Spring'].groupby('hour')['underlying_consumption'].mean()
 
-    annual_export_profile = df.groupby('hour')['grid_export'].mean()
+    annual_transportprofile = df.groupby('hour')['transportload'].mean()
+    annual_heatingprofile = df.groupby('hour')['heatingload'].mean()
+    annual_coolingprofile = df.groupby('hour')['coolingload'].mean()
+    annual_hotwaterprofile = df.groupby('hour')['hotwaterload'].mean()
+    annual_cookingprofile = df.groupby('hour')['cookingload'].mean()
+    annual_activityprofile = df.groupby('hour')['activityload'].mean()
 
+    annual_export_profile = df.groupby('hour')['grid_export'].mean()
+    annual_pv_to_load_profile = df.groupby('hour')['pv_to_load'].mean()
+    annual_pv_to_battery_profile = df.groupby('hour')['pv_to_battery'].mean()
+    annual_pv_curtailed_profile = df.groupby('hour')['pv_curtailed'].mean()
+    annual_battery_to_load_profile = df.groupby('hour')['battery_to_load'].mean()
+    
+    #df.to_csv('debug_consumption_profiles.csv', index=False)  # For debugging purposes
+    
     # Create the figure with subplots - Annual on top row (split), seasons on bottom
     fig = make_subplots(
-        rows=3, cols=4,
+        rows=2, cols=4,
         subplot_titles=('Annual Average (Net Load)',
-                       'Annual (Consumption vs Exports)',
                        'Summer', 'Autumn', 'Winter', 'Spring'),
-        vertical_spacing=0.1,
+        vertical_spacing=0.12,#0.1,
         horizontal_spacing=0.08,
-        row_heights=[1, 2, 1],
+        row_heights=[2, 1],
         specs=[[{"colspan": 4}, None, None, None],
-               [{"colspan": 4}, None, None, None],
-               [{}, {}, {}, {}]]
+               [{}, {}, {}, {}],
+        ]
     )
     
     hours = list(range(24))
@@ -1246,21 +1267,6 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         showlegend=True
     ), row=1, col=1)
 
-    # Annual stacked bar: consumption breakdown vs exports (spans all columns in row 1)
-    fig.add_trace(go.Bar(
-        x=hours, y=annual_underlyingprofile.values,
-        name='Consumption',
-        marker_color='rgba(46, 134, 171, 0.7)',
-        showlegend=True
-    ), row=2, col=1)
-
-    fig.add_trace(go.Bar(
-        x=hours, y=annual_export_profile.values,
-        name='Exports',
-        marker_color='rgba(255, 217, 61, 0.8)',
-        showlegend=True
-    ), row=2, col=1)
-
     # Summer
     fig.add_trace(go.Scatter(
         x=hours, y=summer_profile.values,
@@ -1270,7 +1276,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         fill='tozeroy',
         fillcolor='rgba(247, 127, 0, 0.2)',
         showlegend=False
-    ), row=3, col=1)
+    ), row=2, col=1)
 
     fig.add_trace(go.Scatter(
         x=hours, y=summer_underlyingprofile.values,
@@ -1278,7 +1284,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         name='Original',
         line=dict(color='#F77F00', width=1, dash='dash'),
         showlegend=False
-    ), row=3, col=1)
+    ), row=2, col=1)
     
     # Autumn
     fig.add_trace(go.Scatter(
@@ -1289,7 +1295,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         fill='tozeroy',
         fillcolor='rgba(214, 40, 40, 0.2)',
         showlegend=False
-    ), row=3, col=2)
+    ), row=2, col=2)
     
     fig.add_trace(go.Scatter(
         x=hours, y=autumn_underlyingprofile.values,
@@ -1297,7 +1303,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         name='Original',
         line=dict(color='#D62828', width=1, dash='dash'),
         showlegend=False
-    ), row=3, col=2)
+    ), row=2, col=2)
 
 
     # Winter
@@ -1309,7 +1315,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         fill='tozeroy',
         fillcolor='rgba(0, 48, 73, 0.2)',
         showlegend=False
-    ), row=3, col=3)
+    ), row=2, col=3)
     
     fig.add_trace(go.Scatter(
         x=hours, y=winter_underlyingprofile.values,
@@ -1317,7 +1323,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         name='Original',
         line=dict(color="#006297", width=1, dash='dash'),
         showlegend=False
-    ), row=3, col=3)
+    ), row=2, col=3)
 
     # Spring
     fig.add_trace(go.Scatter(
@@ -1328,7 +1334,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         fill='tozeroy',
         fillcolor='rgba(6, 167, 125, 0.2)',
         showlegend=False
-    ), row=3, col=4)
+    ), row=2, col=4)
     
     fig.add_trace(go.Scatter(
         x=hours, y=spring_underlyingprofile.values,
@@ -1336,7 +1342,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         name='Original',
         line=dict(color='#06A77D', width=1, dash='dash'),
         showlegend=False
-    ), row=3, col=4)
+    ), row=2, col=4)
 
     # Calculate the maximum value across all profiles for consistent y-axis
     max_values = [
@@ -1349,7 +1355,7 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         summer_underlyingprofile.max(),
         autumn_underlyingprofile.max(),
         winter_underlyingprofile.max(),
-        spring_underlyingprofile.max()
+        spring_underlyingprofile.max(),
     ]
     
     min_values = [
@@ -1362,16 +1368,17 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
         summer_underlyingprofile.min(),
         autumn_underlyingprofile.min(),
         winter_underlyingprofile.min(),
-        spring_underlyingprofile.min()
+        spring_underlyingprofile.min(),
     ]
 
     max_value = max(max_values)
     y_max = max_value * 1.1  # Add 10% margin
 
     min_value = min(min_values)
-    y_min = min_value * 1.1  # Add 10% margin
-
-    bar_y_max = max(annual_underlyingprofile.max(), annual_export_profile.max()) * 1.1
+    if min_value < 0:
+        y_min = min_value * 1.1  # Add 10% margin for negative values
+    else:   
+        y_min = min_value * 0.9  # Add 10% margin
 
     # Update axes with consistent y-axis range
     # Row 1, col 1 (Annual line) — hourly tick marks + vertical gridlines
@@ -1379,35 +1386,465 @@ def create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_
                      tickmode='linear', tick0=0, dtick=1,
                      showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.15)')
     fig.update_yaxes(title_text="Avg Power (kW)", row=1, col=1, range=[y_min, y_max])
-    # Row 2, col 1 (Annual stacked bar)
-    fig.update_xaxes(title_text="Hour of Day", row=2, col=1, range=[-0.5, 23.5],
-                     tickmode='linear', tick0=0, dtick=1,
-                     showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.15)')
-    fig.update_yaxes(title_text="Avg Power (kW)", row=2, col=1, range=[0, bar_y_max])
-    
-    # Row 3 (Seasons) — tick every 2 hours + vertical gridlines
+
+    # Row 2 (Seasons) — tick every 2 hours + vertical gridlines
     for j in range(1, 5):
-        fig.update_xaxes(title_text="Hour of Day", row=3, col=j, range=[0, 23],
+        fig.update_xaxes(title_text="Hour of Day", row=2, col=j, range=[0, 23],
                          tickmode='linear', tick0=0, dtick=2,
                          showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.15)',
                          tickfont=dict(size=10))
-        fig.update_yaxes(title_text="Avg Power (kW)", row=3, col=j, range=[y_min, y_max])
-    
+        fig.update_yaxes(title_text="Avg Power (kW)", row=2, col=j, range=[y_min, y_max])
+   
+
     household_name = scenario_param.get('meter_name')
     
     fig.update_layout(
-        title_text=f"Average 24-Hour Residual Load Profiles - {household_name}",
-        height=900,
+        title_text=f"Average 24-Hour Residual Load Profiles for {household_name}",
+        height=700,
         template='plotly_white',
         barmode='stack',
         margin=dict(l=50, r=50, t=80, b=50),
+        # legend: row 1 line traces (Net-load / Original) – sits just above the chart
         legend=dict(
             orientation="h",
             yanchor="bottom",
             y=1.02,
             xanchor="right",
-            x=1
-        )
+            x=1,
+        ),
+    )
+    
+    return fig
+
+
+# df_datetime = df_opt_exogenous_timeseries['t']
+@st.cache_data
+def create_average_daily_simulation_breakdown(df_results, scenario_param, df_opt_exogenous_timeseries):
+    """
+    Create average 24-hour consumption breakdown for the full year and each season (with a selector).
+    
+    Parameters:
+    - df_results: Series or DataFrame column with simulation results
+    - scenario_param: Scenario parameters for the simulation
+    - df_opt_exogenous_timeseries: Optional DataFrame with exogenous timeseries for x-axis
+    """
+    num_points = len(df_results)
+    
+    # Create datetime index
+    if df_opt_exogenous_timeseries is not None and len(df_opt_exogenous_timeseries) > 0:
+        try:
+            datetime_index = pd.to_datetime(df_opt_exogenous_timeseries['t'])
+        except:
+            datetime_index = pd.date_range(start='2021-01-01', periods=num_points, freq='h')
+    else:
+        datetime_index = pd.date_range(start='2021-01-01', periods=num_points, freq='h')
+    
+    df_residualloadprofile_Wh = df_results['E_final_grid_import_Wh'] - df_results['E_final_grid_export_Wh'] - df_results['E_final_grid_export_curtailed_Wh']  # Net grid load profile (positive = import, negative = export)
+    
+    # Create DataFrame with datetime and consumption breakdown
+    df = pd.DataFrame({
+        'datetime': datetime_index,
+        'residual_consumption': df_residualloadprofile_Wh / 1000,  # Convert to kWh
+        'underlying_consumption': df_results['E_underlyingload_Wh'] / 1000,  # Convert to kWh
+        'transportload': df_opt_exogenous_timeseries['E_transportload_kWh'], # type: ignore
+        'heatingload': df_opt_exogenous_timeseries['E_heatingload_kWh'], # type: ignore
+        'coolingload': df_opt_exogenous_timeseries['E_coolingload_kWh'], # type: ignore
+        'hotwaterload': df_opt_exogenous_timeseries['E_hotwaterload_kWh'], # type: ignore
+        'cookingload': df_opt_exogenous_timeseries['E_cookingload_kWh'], # type: ignore
+        'activityload': df_opt_exogenous_timeseries['E_activityload_kWh'], # type: ignore
+        'grid_export': df_results['E_final_grid_export_Wh'] / 1000,  # Convert to kWh
+        'pv_to_load': (df_results['E_PV_generation_Wh'] - df_results['E_initial_excess_generation_Wh']) / 1000,  # Convert to kWh
+        'pv_to_battery': df_results['E_batt_charge_Wh'] / 1000,  # Convert to kWh
+        'pv_curtailed': df_results['E_final_grid_export_curtailed_Wh'] / 1000,  # Convert to kWh
+        'battery_to_load': df_results['E_batt_discharge_Wh'] / 1000,  # Convert to kWh
+    })
+    df['hour'] = df['datetime'].dt.hour
+    df['month'] = df['datetime'].dt.month
+    
+    # Define seasons (Southern Hemisphere)
+    # Summer: Dec, Jan, Feb (12, 1, 2)
+    # Autumn: Mar, Apr, May (3, 4, 5)
+    # Winter: Jun, Jul, Aug (6, 7, 8)
+    # Spring: Sep, Oct, Nov (9, 10, 11)
+    
+    def get_season(month):
+        if month in [12, 1, 2]:
+            return 'Summer'
+        elif month in [3, 4, 5]:
+            return 'Autumn'
+        elif month in [6, 7, 8]:
+            return 'Winter'
+        else:
+            return 'Spring'
+    
+    df['season'] = df['month'].apply(get_season)
+        
+    # Calculate the average profiles, including each season
+    annual_transportprofile = df.groupby('hour')['transportload'].mean()
+    annual_heatingprofile = df.groupby('hour')['heatingload'].mean()
+    annual_coolingprofile = df.groupby('hour')['coolingload'].mean()
+    annual_hotwaterprofile = df.groupby('hour')['hotwaterload'].mean()
+    annual_cookingprofile = df.groupby('hour')['cookingload'].mean()
+    annual_activityprofile = df.groupby('hour')['activityload'].mean()
+    annual_export_profile = df.groupby('hour')['grid_export'].mean()
+    annual_pv_to_load_profile = df.groupby('hour')['pv_to_load'].mean()
+    annual_pv_to_battery_profile = df.groupby('hour')['pv_to_battery'].mean()
+    annual_pv_curtailed_profile = df.groupby('hour')['pv_curtailed'].mean()
+    annual_battery_to_load_profile = df.groupby('hour')['battery_to_load'].mean()
+
+    summer_transportprofile = df[df['season'] == 'Summer'].groupby('hour')['transportload'].mean()
+    summer_heatingprofile = df[df['season'] == 'Summer'].groupby('hour')['heatingload'].mean()
+    summer_coolingprofile = df[df['season'] == 'Summer'].groupby('hour')['coolingload'].mean()
+    summer_hotwaterprofile = df[df['season'] == 'Summer'].groupby('hour')['hotwaterload'].mean()
+    summer_cookingprofile = df[df['season'] == 'Summer'].groupby('hour')['cookingload'].mean()
+    summer_activityprofile = df[df['season'] == 'Summer'].groupby('hour')['activityload'].mean()
+    summer_export_profile = df[df['season'] == 'Summer'].groupby('hour')['grid_export'].mean()
+    summer_pv_to_load_profile = df[df['season'] == 'Summer'].groupby('hour')['pv_to_load'].mean()
+    summer_pv_to_battery_profile = df[df['season'] == 'Summer'].groupby('hour')['pv_to_battery'].mean()
+    summer_pv_curtailed_profile = df[df['season'] == 'Summer'].groupby('hour')['pv_curtailed'].mean()
+    summer_battery_to_load_profile = df[df['season'] == 'Summer'].groupby('hour')['battery_to_load'].mean()
+    
+    autumn_transportprofile = df[df['season'] == 'Autumn'].groupby('hour')['transportload'].mean()
+    autumn_heatingprofile = df[df['season'] == 'Autumn'].groupby('hour')['heatingload'].mean()
+    autumn_coolingprofile = df[df['season'] == 'Autumn'].groupby('hour')['coolingload'].mean()
+    autumn_hotwaterprofile = df[df['season'] == 'Autumn'].groupby('hour')['hotwaterload'].mean()
+    autumn_cookingprofile = df[df['season'] == 'Autumn'].groupby('hour')['cookingload'].mean()
+    autumn_activityprofile = df[df['season'] == 'Autumn'].groupby('hour')['activityload'].mean()
+    autumn_export_profile = df[df['season'] == 'Autumn'].groupby('hour')['grid_export'].mean()
+    autumn_pv_to_load_profile = df[df['season'] == 'Autumn'].groupby('hour')['pv_to_load'].mean()
+    autumn_pv_to_battery_profile = df[df['season'] == 'Autumn'].groupby('hour')['pv_to_battery'].mean()
+    autumn_pv_curtailed_profile = df[df['season'] == 'Autumn'].groupby('hour')['pv_curtailed'].mean()
+    autumn_battery_to_load_profile = df[df['season'] == 'Autumn'].groupby('hour')['battery_to_load'].mean()
+        
+    winter_transportprofile = df[df['season'] == 'Winter'].groupby('hour')['transportload'].mean()
+    winter_heatingprofile = df[df['season'] == 'Winter'].groupby('hour')['heatingload'].mean()
+    winter_coolingprofile = df[df['season'] == 'Winter'].groupby('hour')['coolingload'].mean()
+    winter_hotwaterprofile = df[df['season'] == 'Winter'].groupby('hour')['hotwaterload'].mean()
+    winter_cookingprofile = df[df['season'] == 'Winter'].groupby('hour')['cookingload'].mean()
+    winter_activityprofile = df[df['season'] == 'Winter'].groupby('hour')['activityload'].mean()
+    winter_export_profile = df[df['season'] == 'Winter'].groupby('hour')['grid_export'].mean()
+    winter_pv_to_load_profile = df[df['season'] == 'Winter'].groupby('hour')['pv_to_load'].mean()
+    winter_pv_to_battery_profile = df[df['season'] == 'Winter'].groupby('hour')['pv_to_battery'].mean()
+    winter_pv_curtailed_profile = df[df['season'] == 'Winter'].groupby('hour')['pv_curtailed'].mean()
+    winter_battery_to_load_profile = df[df['season'] == 'Winter'].groupby('hour')['battery_to_load'].mean()
+    
+    spring_transportprofile = df[df['season'] == 'Spring'].groupby('hour')['transportload'].mean()
+    spring_heatingprofile = df[df['season'] == 'Spring'].groupby('hour')['heatingload'].mean()
+    spring_coolingprofile = df[df['season'] == 'Spring'].groupby('hour')['coolingload'].mean()
+    spring_hotwaterprofile = df[df['season'] == 'Spring'].groupby('hour')['hotwaterload'].mean()
+    spring_cookingprofile = df[df['season'] == 'Spring'].groupby('hour')['cookingload'].mean()
+    spring_activityprofile = df[df['season'] == 'Spring'].groupby('hour')['activityload'].mean()
+    spring_export_profile = df[df['season'] == 'Spring'].groupby('hour')['grid_export'].mean()
+    spring_pv_to_load_profile = df[df['season'] == 'Spring'].groupby('hour')['pv_to_load'].mean()
+    spring_pv_to_battery_profile = df[df['season'] == 'Spring'].groupby('hour')['pv_to_battery'].mean()
+    spring_pv_curtailed_profile = df[df['season'] == 'Spring'].groupby('hour')['pv_curtailed'].mean()
+    spring_battery_to_load_profile = df[df['season'] == 'Spring'].groupby('hour')['battery_to_load'].mean()
+    
+    #df.to_csv('debug_consumption_profiles.csv', index=False)  # For debugging purposes
+    
+    # Create the figure with subplots - Annual on top row (split), seasons on bottom
+    fig = make_subplots(
+        rows=1, cols=4,
+        vertical_spacing=0.12,#0.1,
+        horizontal_spacing=0.08,
+        row_heights=[1],
+        specs=[[{"colspan": 4}, None, None, None]]
+    )
+    
+    hours = list(range(24))
+
+    # Consumption breakdown (Annual)
+    # ------------------------------
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_activityprofile.values,
+        name='Base Activity',
+        marker_color='rgba(70, 130, 180, 0.8)',   # steel blue
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_heatingprofile.values,
+        name='Heating',
+        marker_color='rgba(239, 83, 80, 0.8)',    # warm red
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_coolingprofile.values,
+        name='Cooling',
+        marker_color='rgba(66, 165, 245, 0.8)',   # sky blue
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_hotwaterprofile.values,
+        name='Hot Water',
+        marker_color='rgba(38, 166, 154, 0.8)',   # teal
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_cookingprofile.values,
+        name='Cooking',
+        marker_color='rgba(255, 167, 38, 0.8)',   # amber
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_transportprofile.values,
+        name='Transport (EV)',
+        marker_color='rgba(156, 111, 228, 0.8)',  # purple – matches EV/public charging elsewhere
+        showlegend=True,
+        offsetgroup=0,
+    ), row=1, col=1)
+
+    # Generation and storage breakdown
+    # --------------------------------
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_pv_to_load_profile.values,
+        name='PV to Load',
+        marker_color='rgba(255, 217, 61, 0.8)',   # yellow – matches PV generation in Sankey
+        showlegend=True,
+        offsetgroup=1,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_pv_to_battery_profile.values,
+        name='PV to Battery',
+        marker_color='rgba(207, 107, 27, 0.8)',  # brown – matches PV→battery flow in Sankey
+        showlegend=True,
+        offsetgroup=1,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_export_profile.values,
+        name='Grid Exports',
+        marker_color='rgba(180, 160, 10, 0.8)',   # dark gold – matches export flow in Sankey
+        showlegend=True,
+        offsetgroup=1,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_pv_curtailed_profile.values,
+        name='PV Curtailed',
+        marker_color='rgba(239, 108, 0, 0.8)',    # burnt orange – matches spilled PV in Sankey
+        showlegend=True,
+        offsetgroup=1,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=hours, y=annual_battery_to_load_profile.values,
+        name='Battery to Load',
+        marker_color='rgba(107, 207, 127, 0.8)',  # green – matches battery storage in Sankey
+        showlegend=True,
+        offsetgroup=1,
+    ), row=1, col=1)
+
+    
+    annual_consumption_profile = annual_activityprofile + annual_heatingprofile + annual_coolingprofile + annual_hotwaterprofile + annual_cookingprofile + annual_transportprofile
+    annual_selfgen_profile = annual_pv_to_load_profile + annual_battery_to_load_profile + annual_pv_to_battery_profile + annual_export_profile + annual_pv_curtailed_profile
+
+    summer_consumption_profile = summer_activityprofile + summer_heatingprofile + summer_coolingprofile + summer_hotwaterprofile + summer_cookingprofile + summer_transportprofile
+    summer_selfgen_profile = summer_pv_to_load_profile + summer_battery_to_load_profile + summer_pv_to_battery_profile + summer_export_profile + summer_pv_curtailed_profile
+
+    autumn_consumption_profile = autumn_activityprofile + autumn_heatingprofile + autumn_coolingprofile + autumn_hotwaterprofile + autumn_cookingprofile + autumn_transportprofile
+    autumn_selfgen_profile = autumn_pv_to_load_profile + autumn_battery_to_load_profile + autumn_pv_to_battery_profile + autumn_export_profile + autumn_pv_curtailed_profile
+
+    winter_consumption_profile = winter_activityprofile + winter_heatingprofile + winter_coolingprofile + winter_hotwaterprofile + winter_cookingprofile + winter_transportprofile
+    winter_selfgen_profile = winter_pv_to_load_profile + winter_battery_to_load_profile + winter_pv_to_battery_profile + winter_export_profile + winter_pv_curtailed_profile
+
+    spring_consumption_profile = spring_activityprofile + spring_heatingprofile + spring_coolingprofile + spring_hotwaterprofile + spring_cookingprofile + spring_transportprofile
+    spring_selfgen_profile = spring_pv_to_load_profile + spring_battery_to_load_profile + spring_pv_to_battery_profile + spring_export_profile + spring_pv_curtailed_profile
+    
+    fig.add_trace(go.Scatter(
+        x=hours, y=annual_pv_to_load_profile + annual_pv_to_battery_profile + annual_export_profile + annual_pv_curtailed_profile,
+        mode='lines',
+        name='PV Generation',
+        line=dict(color='rgba(252, 202, 19, 0.8)', width=2),
+        showlegend=True,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=hours, y=annual_consumption_profile,
+        mode='lines',
+        name='Consumption',
+        line=dict(color='rgba(70, 130, 180, 0.8)', width=2),  # steel blue
+        showlegend=True,
+        visible="legendonly",
+    ), row=1, col=1)
+    
+
+    # Calculate the maximum value across all profiles for consistent y-axis
+    max_values = [
+        annual_consumption_profile.max(),
+        summer_consumption_profile.max(),
+        autumn_consumption_profile.max(),
+        winter_consumption_profile.max(),
+        spring_consumption_profile.max(),
+        annual_selfgen_profile.max(),
+        summer_selfgen_profile.max(),
+        autumn_selfgen_profile.max(),
+        winter_selfgen_profile.max(),
+        spring_selfgen_profile.max(),
+    ]
+    
+    min_values = [
+        annual_consumption_profile.min(),
+        summer_consumption_profile.min(),
+        autumn_consumption_profile.min(),
+        winter_consumption_profile.min(),
+        spring_consumption_profile.min(),
+        annual_selfgen_profile.min(),
+        summer_selfgen_profile.min(),
+        autumn_selfgen_profile.min(),
+        winter_selfgen_profile.min(),
+        spring_selfgen_profile.min(),
+    ]
+
+    max_value = max(max_values)
+    y_max = max_value * 1.1  # Add 10% margin
+
+    min_value = min(min_values)
+    if min_value < 0:
+        y_min = min_value * 1.1  # Add 10% margin for negative values
+    else:   
+        y_min = min_value * 0.9  # Add 10% margin
+
+    fig.update_xaxes(title_text="Hour of Day", row=1, col=1, range=[-0.5, 23.5],
+                     tickmode='array',
+                     tickvals=list(range(24)),
+                     ticktext=[str(h) for h in range(24)],
+                     showgrid=False,
+                     minor=dict(
+                         tickmode='linear',
+                         tick0=-0.5,
+                         dtick=1,
+                         showgrid=True,
+                         gridwidth=1,
+                         gridcolor='rgba(128,128,128,0.15)',
+                     ))
+    fig.update_yaxes(title_text="Avg Power (kW)", row=1, col=1, range=[0, y_max])
+    
+
+    household_name = scenario_param.get('meter_name')
+    
+    # Season selector dropdown — swaps the y-data of all 12 traces in-place.
+    # Trace order matches add_trace calls above:
+    #   0  Base Activity        (offsetgroup=0)
+    #   1  Heating              (offsetgroup=0)
+    #   2  Cooling              (offsetgroup=0)
+    #   3  Hot Water            (offsetgroup=0)
+    #   4  Cooking              (offsetgroup=0)
+    #   5  Transport (EV)       (offsetgroup=0)
+    #   6  PV to Load           (offsetgroup=1)
+    #   7  PV to Battery        (offsetgroup=1)
+    #   8  Grid Exports         (offsetgroup=1)
+    #   9  PV Curtailed         (offsetgroup=1)
+    #  10  Battery to Load      (offsetgroup=1)
+    #  11  PV Generation        (scatter line)
+    def _season_y(act, heat, cool, hw, cook, trans,
+                    pvload, pvbatt, exp, pvcut, battload):
+        return [
+            act.values.tolist(), heat.values.tolist(), cool.values.tolist(),
+            hw.values.tolist(), cook.values.tolist(), trans.values.tolist(),
+            pvload.values.tolist(), pvbatt.values.tolist(), exp.values.tolist(),
+            pvcut.values.tolist(), battload.values.tolist(),
+            (pvload + pvbatt + exp + pvcut).values.tolist(),
+        ]
+        
+    fig.update_layout(
+        title_text=f"Consumption and generation component breakdown",
+        height=500,
+        template='plotly_white',
+        barmode='stack',
+        margin=dict(l=50, r=50, t=80, b=50),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=1.09, #0.39,
+            xanchor="center",
+            x=0.5,
+            bgcolor="rgba(255,255,255,0)",
+        ),
+
+        updatemenus = [
+            dict(
+                type="dropdown",
+                direction="down",
+                buttons=[
+                    dict(
+                        label="Annual",
+                        method="restyle",
+                        args=[{"y": _season_y(
+                            annual_activityprofile, annual_heatingprofile, annual_coolingprofile,
+                            annual_hotwaterprofile, annual_cookingprofile, annual_transportprofile,
+                            annual_pv_to_load_profile, annual_pv_to_battery_profile,
+                            annual_export_profile, annual_pv_curtailed_profile,
+                            annual_battery_to_load_profile,
+                        )}, list(range(12))]
+                    ),
+                    dict(
+                        label="Summer",
+                        method="restyle",
+                        args=[{"y": _season_y(
+                            summer_activityprofile, summer_heatingprofile, summer_coolingprofile,
+                            summer_hotwaterprofile, summer_cookingprofile, summer_transportprofile,
+                            summer_pv_to_load_profile, summer_pv_to_battery_profile,
+                            summer_export_profile, summer_pv_curtailed_profile,
+                            summer_battery_to_load_profile,
+                        )}, list(range(12))]
+                    ),
+                    dict(
+                        label="Autumn",
+                        method="restyle",
+                        args=[{"y": _season_y(
+                            autumn_activityprofile, autumn_heatingprofile, autumn_coolingprofile,
+                            autumn_hotwaterprofile, autumn_cookingprofile, autumn_transportprofile,
+                            autumn_pv_to_load_profile, autumn_pv_to_battery_profile,
+                            autumn_export_profile, autumn_pv_curtailed_profile,
+                            autumn_battery_to_load_profile,
+                        )}, list(range(12))]
+                    ),
+                    dict(
+                        label="Winter",
+                        method="restyle",
+                        args=[{"y": _season_y(
+                            winter_activityprofile, winter_heatingprofile, winter_coolingprofile,
+                            winter_hotwaterprofile, winter_cookingprofile, winter_transportprofile,
+                            winter_pv_to_load_profile, winter_pv_to_battery_profile,
+                            winter_export_profile, winter_pv_curtailed_profile,
+                            winter_battery_to_load_profile,
+                        )}, list(range(12))]
+                    ),
+                    dict(
+                        label="Spring",
+                        method="restyle",
+                        args=[{"y": _season_y(
+                            spring_activityprofile, spring_heatingprofile, spring_coolingprofile,
+                            spring_hotwaterprofile, spring_cookingprofile, spring_transportprofile,
+                            spring_pv_to_load_profile, spring_pv_to_battery_profile,
+                            spring_export_profile, spring_pv_curtailed_profile,
+                            spring_battery_to_load_profile,
+                        )}, list(range(12))]
+                    ),
+                ],
+                pad={"r": 10, "t": 10},
+                showactive=True,
+                x=0.9,
+                xanchor="left",
+                y=1.0,
+                yanchor="top",
+                font=dict(color="black", size=14), 
+                bgcolor="rgba(255,255,255,0.6)",
+                bordercolor="rgba(0,0,0,0.1)",
+            )
+        ]
+        
     )
     
     return fig
@@ -2577,6 +3014,10 @@ def create_streamlit_dashboard(df_results, summary, df_opt_exogenous_timeseries,
         sim_profiles_fig = create_average_daily_simulation_profiles(df_results, scenario_param, df_opt_exogenous_timeseries)
         st.plotly_chart(sim_profiles_fig, use_container_width=True)
 
+        sim_breakdown_fig = create_average_daily_simulation_breakdown(df_results, scenario_param, df_opt_exogenous_timeseries)
+        st.plotly_chart(sim_breakdown_fig, use_container_width=True)
+
+
 
 #%% ===========================================================================
 # Cached data loading functions
@@ -2792,7 +3233,7 @@ def main():
             
         with st.expander("Transport 🚗"):
 
-            default_numcars = 2
+            default_numcars = 2 # XXX move to Excel
             _col_cars, _ = st.columns(2)
             with _col_cars:
                 selected_numcars = st.number_input(
@@ -2807,17 +3248,17 @@ def main():
             selected_car_schedules = []  # dict with depart_hour/arrive_hour for EVs, None for ICE
             selected_car_charger_speeds = []
             selected_car_charging_strategies = []
-            for i in range(1, selected_numcars + 1):
+            for i in range(1, selected_numcars + 1): # i = 1
                 with st.expander(f"Car {i}", expanded=True):
                     car_type_options = ['Petrol', 'Diesel', 'Electric']
-                    try:
+                    try: #rather than default, it is initial
                         default_car_type = str(df_xls_initial_param.at[f'Car_{i}_Type', 'Value'])
                         default_car_distance = int(str(df_xls_initial_param.at[f'Car_{i}_Distance', 'Value']))
                         default_car_type_index = car_type_options.index(default_car_type)
                     except (KeyError, ValueError):
                         # Fallback to first option if default not found
                         default_car_type_index = 0
-                        default_car_distance = 12500
+                        default_car_distance = 12500 #XXX move to Excel
                     car_type = st.selectbox(
                         f"Fuel Type",
                         options=car_type_options,
@@ -2907,7 +3348,7 @@ def main():
                         if blocks_key not in st.session_state:
                             st.session_state[blocks_key] = len(saved_schedule) if saved_schedule else 1
                         time_blocks = []
-                        for b in range(1, st.session_state[blocks_key] + 1):
+                        for b in range(1, st.session_state[blocks_key] + 1): #b = 1
                             depart_key = f'car_{i}_depart_{b}'
                             arrive_key = f'car_{i}_arrive_{b}'
                             # Initialise widget state if not already set (from saved schedule or PARAM defaults)
@@ -2929,20 +3370,38 @@ def main():
                                     if st.button("✕", key=f'car_{i}_del_block_{b}', help="Remove this block"):
                                         st.session_state[blocks_key] -= 1
                                         st.rerun()
-                            with col_dep:
-                                dep_time = st.time_input(
+                            with col_dep: # sets up st.session_state[depart_key].hour and .minute
+                                st.time_input(
                                     "Depart",
                                     step=3600,
                                     key=depart_key
                                 )
                             with col_arr:
-                                arr_time = st.time_input(
+                                # Only offer arrive hours that are strictly after the depart hour
+                                depart_h = st.session_state[depart_key].hour
+                                arrive_hour_options = [datetime_time(h, 0) for h in range(depart_h + 1, 24)]
+                                if not arrive_hour_options:
+                                    arrive_hour_options = [datetime_time(23, 0)]
+                                # Clamp stored arrive time to a valid option if depart moved forward
+                                current_arrive = st.session_state.get(arrive_key, arrive_hour_options[0])
+                                if current_arrive not in arrive_hour_options:
+                                    current_arrive = arrive_hour_options[0]
+                                    st.session_state[arrive_key] = current_arrive
+                                selected_arrive = st.selectbox(
                                     "Arrive",
-                                    step=3600,
-                                    key=arrive_key
+                                    options=arrive_hour_options,
+                                    index=arrive_hour_options.index(current_arrive),
+                                    format_func=lambda t: t.strftime("%H:%M"),
                                 )
-                            time_blocks.append({'depart_hour': dep_time.hour, 'depart_minute': dep_time.minute,
-                                                'arrive_hour': arr_time.hour, 'arrive_minute': arr_time.minute})
+                                st.session_state[arrive_key] = selected_arrive
+                            # Read from session state (always authoritative) rather than widget return values,
+                            # which may not reflect programmatically-set defaults on the first render run.
+                            time_blocks.append({
+                                'depart_hour': st.session_state[depart_key].hour,
+                                'depart_minute': st.session_state[depart_key].minute,
+                                'arrive_hour': st.session_state[arrive_key].hour,
+                                'arrive_minute': st.session_state[arrive_key].minute,
+                            })
                         if st.button("＋ Add time block", key=f'car_{i}_add_block'):
                             st.session_state[blocks_key] += 1
                             st.rerun()
@@ -2986,26 +3445,24 @@ def main():
             try:
                 default_solar_capacity = float(str(df_xls_initial_param.at['SolarPV_capacity_kW', 'Value']))
             except (KeyError, ValueError):
-                default_solar_capacity = 5.0
+                default_solar_capacity = 0
             selected_solar_capacity = st.number_input(
                 "Rated Capacity (kWp)",
                 min_value=0.0,
-                max_value=25.0,
                 value=default_solar_capacity,
                 step=1.0,
                 format="%.1f"
             )
 
-        with st.expander("Batteries 🔋", expanded = True):
+        with st.expander("Batteries 🔋"):
             # Battery storage capacity
             try:
                 default_battery_capacity = float(str(df_xls_initial_param.at['Battery_capacity_kWh', 'Value']))
             except (KeyError, ValueError):
-                default_battery_capacity = 5.0
+                default_battery_capacity = 0
             selected_battery_capacity = st.number_input(
                 "Storage Capacity (kWh)",
                 min_value=0.0,
-                max_value=50.0,
                 value=default_battery_capacity,
                 step=1.0,
                 format="%.1f"
@@ -3021,7 +3478,7 @@ def main():
                 step=1.0,
                 format="%.0f"
             )
-        
+
     with st.sidebar.expander("Financial 💲"):
         
         st.subheader("⚡ Electricity")
@@ -3483,6 +3940,14 @@ def main():
              ts_transport_electricity_Wh] = create_transport_electricity_profile(selected_cars, df_opt_exogenous_timeseries, SCENARIO_PARAM) # scenario_param = SCENARIO_PARAM
             df_opt_exogenous_timeseries['E_netload_kWh'] += ts_transport_electricity_Wh / 1000
 
+            # Save away the additional elements added to the netload 
+            df_opt_exogenous_timeseries['E_transportload_kWh'] = ts_transport_electricity_Wh / 1000
+            df_opt_exogenous_timeseries['E_heatingload_kWh'] = np.tile(v_electrical_heating_demand_kWh, financial_horizon)
+            df_opt_exogenous_timeseries['E_coolingload_kWh'] = np.tile(v_electrical_cooling_demand_kWh, financial_horizon)
+            df_opt_exogenous_timeseries['E_hotwaterload_kWh'] = np.tile(v_electrical_hotwater_demand_kWh, financial_horizon)
+            df_opt_exogenous_timeseries['E_cookingload_kWh'] = np.tile(v_electrical_cooking_demand_kWh, financial_horizon)
+            df_opt_exogenous_timeseries['E_activityload_kWh'] = np.tile(v_household_consumption, financial_horizon)
+
             # Run the simulation
             i_static_param = SCENARIO_PARAM
             i_df_energy_ts = df_opt_exogenous_timeseries
@@ -3510,6 +3975,33 @@ def main():
 
             # Create the interactive Streamlit dashboard of the outputs
             create_streamlit_dashboard(df_results, summary, df_opt_exogenous_timeseries, SCENARIO_PARAM)
+
+            # --- Download results ---
+            _zip_buf = io.BytesIO()
+            with zipfile.ZipFile(_zip_buf, mode='w', compression=zipfile.ZIP_DEFLATED) as _zf:
+                # Also 
+                _zf.writestr('df_results.csv',
+                             df_results.to_csv(index=True))
+                _zf.writestr('df_opt_exogenous_timeseries.csv',
+                             df_opt_exogenous_timeseries.to_csv(index=True))
+                _zf.writestr('summary.json',
+                             json.dumps(summary, indent=2, default=str))
+                _zf.writestr('scenario_param.json',
+                             json.dumps(SCENARIO_PARAM, indent=2, default=str))
+                #Also include the input data used for the simulation in INPUT_FILE
+                _zf.writestr(INPUT_FILE,
+                             open(INPUT_FILE, 'rb').read())
+                # Include the main.py script itself
+                _zf.writestr('main.py',
+                             open('main.py', 'rb').read())
+            _zip_buf.seek(0)
+            st.download_button(
+                label="⬇️ Download Materiality results (.zip)",
+                data=_zip_buf.getvalue(),
+                # with datetimestamp
+                file_name=f"materiality_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip", 
+                mime="application/zip",
+            )
     
     #     s of the outputst.session_state[log_key] = True  # Mark as logged
     #     st.sidebar.json(dict(st.session_state))
